@@ -34,14 +34,14 @@ enum HttpMethod {
 }
 
 impl HttpMethod {
-  fn from_header(req: &Vec<String>) -> Result<HttpMethod, HttpError> {
-    if req.len() == 0 { return Err(HttpError::BadRequest); }
+  fn from_header(req: &Vec<String>) -> Option<HttpMethod> {
+    if req.len() == 0 { return None; }
     let mut words = req[0].split_whitespace();
     let m = words.next().unwrap();
     let r = words.next().unwrap().to_string();
     match m {
-      "GET" => Ok(HttpMethod::GET(r)),
-      _ => Err(HttpError::BadRequest),
+      "GET" => Some(HttpMethod::GET(r)),
+      _ => None,
     }
   }
 }
@@ -105,19 +105,21 @@ impl HttpServer {
     }
   }
 
+  fn handle_error(&self, stream: TcpStream, err: HttpError) -> HttpResponse {
+    let handler = Arc::clone(
+      self.error_handlers.get(&err).unwrap()
+    );
+    self.threadpool.execute(handler, stream);
+    Err(err)
+  }
+
   fn route(&mut self, stream: TcpStream, method: HttpMethod) -> HttpResponse {
     match self.routes.get(&method) {
       Some(f) => {
         self.threadpool.execute(Arc::clone(f), stream);
         Ok("NotImplement: thread not joining".to_string())
       },
-      None => {
-        let handler = Arc::clone(
-          self.error_handlers.get(&HttpError::NotFound).unwrap()
-        );
-        self.threadpool.execute(handler, stream);
-        Err(HttpError::NotFound)
-      }
+      None => self.handle_error(stream, HttpError::NotFound),
     }
   }
 
@@ -131,8 +133,8 @@ impl HttpServer {
 
     let (method, resp): (Option<HttpMethod>, HttpResponse) =
       match HttpMethod::from_header(&req) {
-        Ok(m) => (Some(m.clone()), self.route(stream, m.clone())),
-        Err(_) => (None, Err(HttpError::BadRequest)),
+        Some(m) => (Some(m.clone()), self.route(stream, m.clone())),
+        None => (None, self.handle_error(stream, HttpError::BadRequest)),
       };
 
     self.logger.push(&method, &resp);
