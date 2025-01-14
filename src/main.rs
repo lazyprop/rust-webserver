@@ -11,10 +11,11 @@ use threadpool::ThreadPool;
 
 
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum HttpError {
   BadRequest,
   NotFound,
+  InternalServerError,
 }
 
 impl HttpError {
@@ -22,6 +23,7 @@ impl HttpError {
     match self {
       Self::BadRequest => "400 Bad Request",
       Self::NotFound => "404 Not Found",
+      Self::InternalServerError => "500 Internal Server Error",
     }.to_string()
   }
 }
@@ -67,17 +69,39 @@ type Job = (TcpStream, RouteFn);
 struct HttpServer {
   addr: String,
   routes: HashMap<HttpMethod, RouteFn>,
+  error_handlers: HashMap<HttpError, RouteFn>,
   threadpool: ThreadPool<TcpStream>,
   logger: HttpLogger,
 }
 
 impl HttpServer {
   fn new(addr: &str) -> Self {
+    let mut error_handlers = HashMap::<HttpError, RouteFn>::new();
+
+    error_handlers.insert(
+      HttpError::NotFound,
+      Arc::new(|mut stream| {
+        stream.write_all("404".as_bytes()).unwrap();
+      }));
+    
+    error_handlers.insert(
+      HttpError::BadRequest,
+      Arc::new(|mut stream| {
+        stream.write_all("400".as_bytes()).unwrap();
+      }));
+    
+    error_handlers.insert(
+      HttpError::InternalServerError,
+      Arc::new(|mut stream| {
+        stream.write_all("500".as_bytes()).unwrap();
+      }));
+    
     HttpServer {
       addr: addr.to_string(),
       routes: HashMap::new(),
       threadpool: ThreadPool::<TcpStream>::new(5),
       logger: HttpLogger::new(),
+      error_handlers,
     }
   }
 
@@ -85,9 +109,15 @@ impl HttpServer {
     match self.routes.get(&method) {
       Some(f) => {
         self.threadpool.execute(Arc::clone(f), stream);
-        return Ok("NotImplement: thread not joining".to_string());
+        Ok("NotImplement: thread not joining".to_string())
       },
-      None => Err(HttpError::NotFound),
+      None => {
+        let handler = Arc::clone(
+          self.error_handlers.get(&HttpError::NotFound).unwrap()
+        );
+        self.threadpool.execute(handler, stream);
+        Err(HttpError::NotFound)
+      }
     }
   }
 
@@ -118,7 +148,9 @@ impl HttpServer {
   fn postprocess_response(resp: HttpResponse) -> String {
     let (status, content) = match resp {
       Ok(s) => ("200 OK".to_string(), s),
-      Err(e) => (e.to_string(), e.to_string()),
+      Err(e) => {
+        (e.to_string(), e.to_string())
+      },
     };
     let len = content.len();
     format!("HTTP/1.1 {status}\r\nContent-length: {len}\r\n\r\n{content}")

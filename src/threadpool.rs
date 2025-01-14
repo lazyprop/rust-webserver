@@ -51,7 +51,7 @@ where T: Send + 'static
 }
 
 #[cfg(test)]
-fn threadpool_test() {
+fn test_threadpool() {
     // Create a thread pool with 4 workers
     let pool = ThreadPool::<String>::new(4);
 
