@@ -2,63 +2,28 @@ use std::collections::HashMap;
 use::std::net::{TcpListener, TcpStream};
 use std::io::{BufRead, BufReader, Write};
 use std::fs;
-use std::thread::{self, JoinHandle};
-use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::sync::Arc;
 use std::time::Duration;
 
+pub mod threadpool;
+use threadpool::ThreadPool;
 
-struct Worker {
-  id: usize,
-  handle: JoinHandle<()>,
-}
 
-impl Worker {
-  fn new(id: usize, rx: Arc<Mutex<mpsc::Receiver<Job>>>) -> Self {
-    Worker {
-      id: id,
-      handle: thread::spawn(move || {
-        let rx = rx;
-        loop {
-          let job = rx.lock().unwrap().recv().unwrap();
-          println!("worker {} got job", &id);
-          job();
-        }
-      }),
-    }
-  }
-}
-
-type Job = Box<dyn FnOnce() + Send + 'static>;
-
-struct ThreadPool {
-  workers: Vec<Worker>,
-  tx: mpsc::Sender<Job>,
-  n: usize,
-}
-
-impl ThreadPool {
-  fn new(n: usize) -> Self {
-    let (tx, rx) = mpsc::channel();
-    let rx = Arc::new(Mutex::new(rx));
-    let mut workers: Vec<Worker> = Vec::with_capacity(n);
-    for i in 0..n {
-      workers.push(Worker::new(i, Arc::clone(&rx)));
-    }
-    ThreadPool { workers: workers, tx: tx, n: n }
-  }
-
-  fn execute<F>(&mut self, f: F)
-    where F: FnOnce() + Send + 'static
-  {
-    let job = Box::new(f);
-    self.tx.send(job).unwrap();
-  }
-}
 
 #[derive(Debug, Clone)]
 enum HttpError {
   BadRequest,
   NotFound,
+}
+
+impl HttpError {
+  fn to_string(&self) -> String {
+    match self {
+      Self::BadRequest => "400 Bad Request",
+      Self::NotFound => "404 Not Found",
+    }.to_string()
+  }
 }
 
 #[derive(PartialEq, Eq, Hash, Debug, Clone)]
@@ -79,8 +44,7 @@ impl HttpMethod {
   }
 }
 
-type RouteFn = fn(TcpStream);
-type HttpResponse = Result<(), HttpError>;
+type HttpResponse = Result<String, HttpError>;
 type LogEntry = (Option<HttpMethod>, HttpResponse);
 
 struct HttpLogger {
@@ -97,10 +61,13 @@ impl HttpLogger {
   }
 }
 
+type RouteFn = threadpool::JobFn<TcpStream>;
+type Job = (TcpStream, RouteFn);
+
 struct HttpServer {
   addr: String,
-  routes: HashMap<HttpMethod, Box<RouteFn>>,
-  threadpool: ThreadPool,
+  routes: HashMap<HttpMethod, RouteFn>,
+  threadpool: ThreadPool<TcpStream>,
   logger: HttpLogger,
 }
 
@@ -109,17 +76,16 @@ impl HttpServer {
     HttpServer {
       addr: addr.to_string(),
       routes: HashMap::new(),
-      threadpool: ThreadPool::new(5),
+      threadpool: ThreadPool::<TcpStream>::new(5),
       logger: HttpLogger::new(),
     }
   }
 
-  fn route(&mut self, stream: TcpStream, method: &HttpMethod) -> HttpResponse {
+  fn route(&mut self, stream: TcpStream, method: HttpMethod) -> HttpResponse {
     match self.routes.get(&method) {
-      Some(r) => {
-        let r = r.clone();
-        self.threadpool.execute(move ||  r(stream));
-        return Ok(());
+      Some(f) => {
+        self.threadpool.execute(Arc::clone(f), stream);
+        return Ok("NotImplement: thread not joining".to_string());
       },
       None => Err(HttpError::NotFound),
     }
@@ -135,7 +101,7 @@ impl HttpServer {
 
     let (method, resp): (Option<HttpMethod>, HttpResponse) =
       match HttpMethod::from_header(&req) {
-        Ok(m) => (Some(m.clone()), self.route(stream, &m)),
+        Ok(m) => (Some(m.clone()), self.route(stream, m.clone())),
         Err(_) => (None, Err(HttpError::BadRequest)),
       };
 
@@ -149,28 +115,31 @@ impl HttpServer {
     }
   }
 
-  fn add_route(&mut self, m: HttpMethod, f: RouteFn) {
-    self.routes.insert(m, Box::new(f));
+  fn postprocess_response(resp: HttpResponse) -> String {
+    let (status, content) = match resp {
+      Ok(s) => ("200 OK".to_string(), s),
+      Err(e) => (e.to_string(), e.to_string()),
+    };
+    let len = content.len();
+    format!("HTTP/1.1 {status}\r\nContent-length: {len}\r\n\r\n{content}")
+  }
+
+  fn add_route(&mut self, m: HttpMethod, f: fn(HttpMethod) -> HttpResponse) {
+    self.routes.insert(
+      m.clone(),
+      Arc::new(move |mut stream: TcpStream| {
+        stream.write_all(Self::postprocess_response(f(m.clone())).as_bytes()).unwrap();
+      })
+    );
   }
 }
 
 
-fn constr_response(status: u16, content: String) -> String {
-  let status_line = match status {
-    200 => "200 OK",
-    404 => "404 Not Found",
-    400 => "400 Bad Request",
-    _ => ""
-  };
-  let len = content.len();
-  format!("HTTP/1.1 {status_line}\r\nContent-length: {len}\r\n\r\n{content}")
-}
-
-fn ok_html(stream: &mut TcpStream, filename: &str) {
-  let resp = constr_response(
-    200,
-    fs::read_to_string(filename).unwrap());
-  stream.write_all(resp.as_bytes()).unwrap();
+fn ok_html(filename: &str) -> HttpResponse {
+  match fs::read_to_string(filename) {
+    Ok(s) => Ok(s),
+    Err(_) => Err(HttpError::NotFound),
+  }
 }
 
 fn main() {
@@ -179,12 +148,12 @@ fn main() {
 
 
   app.add_route(GET("/".to_string()),
-                |mut stream| ok_html(&mut stream, "hello.html"));
+                |_| ok_html("hello.html"));
   
   app.add_route(GET("/sleep".to_string()),
-                |mut stream| {
+                |_| {
                   thread::sleep(Duration::from_secs(5));
-                  ok_html(&mut stream, "hello.html")});
+                  ok_html("hello.html")});
   app.serve();
 }
 
